@@ -77,6 +77,9 @@ fork or config change is needed — just install this package alongside it.
   `-M enable_thinking=true` to enable it if your base template supports it.
 - **One checkpoint per model handle.** Point at a different `tinker://` path to
   serve a different checkpoint.
+- **Base vs tuned.** A plain HF id serves the *untuned* base model through the same
+  path — `tinker/Qwen/Qwen3.5-9B` — so the baseline arm of a base-vs-tuned comparison
+  goes through identical rendering/parsing as `tinker/tinker://<checkpoint>`.
 
 ## Develop / test
 

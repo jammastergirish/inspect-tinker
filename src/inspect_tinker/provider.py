@@ -137,14 +137,21 @@ class TinkerAPI(ModelAPI):
             api_key_vars=["TINKER_API_KEY"],
             config=config,
         )
-        # model_name is the part after the "tinker/" provider prefix, i.e. the
-        # full "tinker://<run>:train:0/sampler_weights/<name>" checkpoint path.
+        # model_name is the part after the "tinker/" provider prefix. Two forms:
+        #   tinker://<run>:train:0/sampler_weights/<name>  -> a tuned checkpoint
+        #   <hf-id>, e.g. Qwen/Qwen3.5-9B                  -> the untuned base model
+        # The base form lets you run the baseline arm of a base-vs-tuned comparison
+        # through the same provider (no adapter attached).
         self.checkpoint = model_name
-        self.base_model = (
-            base_model
-            or os.environ.get("INSPECT_TINKER_BASE_MODEL")
-            or DEFAULT_BASE_MODEL
-        )
+        self.is_base = not model_name.startswith("tinker://")
+        if self.is_base:
+            self.base_model = base_model or model_name
+        else:
+            self.base_model = (
+                base_model
+                or os.environ.get("INSPECT_TINKER_BASE_MODEL")
+                or DEFAULT_BASE_MODEL
+            )
         self.enable_thinking = bool(enable_thinking)
 
         from transformers import AutoTokenizer
@@ -158,9 +165,14 @@ class TinkerAPI(ModelAPI):
 
     async def _sampler_client(self):
         if self._sampler is None:
-            self._sampler = await self._service.create_sampling_client_async(
-                model_path=self.checkpoint
-            )
+            if self.is_base:
+                self._sampler = await self._service.create_sampling_client_async(
+                    base_model=self.base_model
+                )
+            else:
+                self._sampler = await self._service.create_sampling_client_async(
+                    model_path=self.checkpoint
+                )
         return self._sampler
 
     def _render(self, input: list[Any], tools: list[ToolInfo], drop_tools: bool):

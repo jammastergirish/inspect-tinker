@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "inspect-tinker"
-version = "0.1.0"
+version = "0.1.1"
 description = "A Tinker-backed model provider for Inspect AI — use a Tinker checkpoint as tinker/<path>."
 readme = "README.md"
 requires-python = ">=3.11"
