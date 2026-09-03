@@ -85,6 +85,38 @@ def test_parse_multiple_tool_calls():
     assert calls[1].arguments == {"x": 1}
 
 
+def test_parse_qwen_xml_tool_call():
+    # Qwen3.5 emits this XML form under tool use (not Hermes JSON).
+    text = (
+        "Let me look.\n"
+        "<tool_call>\n<function=bash>\n<parameter=command>\n"
+        "ls -la /home/app/\n</parameter>\n</function>\n</tool_call>"
+    )
+    content, calls = parse_tool_calls(text)
+    assert content == "Let me look."
+    assert len(calls) == 1
+    assert calls[0].function == "bash"
+    assert calls[0].arguments == {"command": "ls -la /home/app/"}
+
+
+def test_parse_qwen_xml_multi_parameter():
+    text = (
+        "<tool_call><function=text_editor>"
+        "<parameter=command>str_replace</parameter>"
+        "<parameter=path>/etc/x</parameter>"
+        "<parameter=old_str>a</parameter><parameter=new_str>b</parameter>"
+        "</function></tool_call>"
+    )
+    _, calls = parse_tool_calls(text)
+    assert calls[0].function == "text_editor"
+    assert calls[0].arguments == {
+        "command": "str_replace",
+        "path": "/etc/x",
+        "old_str": "a",
+        "new_str": "b",
+    }
+
+
 def test_parse_no_tool_calls():
     content, calls = parse_tool_calls("just some prose, no calls")
     assert content == "just some prose, no calls"

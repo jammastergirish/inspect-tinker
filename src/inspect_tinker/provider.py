@@ -36,7 +36,13 @@ DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-9B"
 TURN_END = "<|im_end|>"  # Qwen assistant-turn terminator
 
 # Hermes / Qwen tool-call block: <tool_call>{"name": ..., "arguments": {...}}</tool_call>
-_TOOLCALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+# Qwen emits tool calls in two syntaxes; we parse both:
+#   Hermes JSON:  <tool_call>{"name": ..., "arguments": {...}}</tool_call>
+#   Qwen XML:     <tool_call><function=NAME><parameter=KEY>VALUE</parameter>...</function></tool_call>
+# Qwen3.5 uses the XML form under tool use.
+_TOOLCALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+_FUNC_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
+_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
 
 
 # --------------------------------------------------------------------------- #
@@ -86,31 +92,58 @@ def tool_to_schema(tool: ToolInfo) -> dict[str, Any]:
     }
 
 
-def parse_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
-    """Split Hermes/Qwen output into (content, tool_calls).
+def _xml_tool_call(fname: str, body: str) -> ToolCall:
+    """Build a ToolCall from a Qwen XML <function=..><parameter=..> body."""
+    args = {k.strip(): v.strip() for k, v in _PARAM_RE.findall(body)}
+    return ToolCall(id=uuid.uuid4().hex[:8], function=fname.strip(), arguments=args)
 
-    Every ``<tool_call>{json}</tool_call>`` block becomes a ToolCall; malformed
-    JSON is preserved with a ``parse_error`` rather than dropped. The remaining
-    text (blocks removed) is the assistant content.
+
+def parse_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
+    """Split Qwen/Hermes output into (content, tool_calls).
+
+    Handles both syntaxes Qwen emits — Hermes JSON
+    (``<tool_call>{"name":..,"arguments":{..}}</tool_call>``) and the Qwen XML form
+    (``<tool_call><function=NAME><parameter=KEY>VALUE</parameter>..</function></tool_call>``,
+    which Qwen3.5 uses). Malformed blocks are preserved with a ``parse_error`` rather
+    than dropped. The remaining text (blocks removed) is the assistant content.
     """
     calls: list[ToolCall] = []
     for m in _TOOLCALL_RE.finditer(text):
-        raw = m.group(1)
+        inner = m.group(1).strip()
         cid = uuid.uuid4().hex[:8]
-        try:
-            obj = json.loads(raw)
+        if inner.startswith("{"):  # Hermes JSON
+            try:
+                obj = json.loads(inner)
+                calls.append(
+                    ToolCall(
+                        id=cid,
+                        function=str(obj.get("name", "")),
+                        arguments=obj.get("arguments", {}) or {},
+                    )
+                )
+            except (json.JSONDecodeError, TypeError) as e:
+                calls.append(
+                    ToolCall(id=cid, function="", arguments={}, parse_error=str(e))
+                )
+            continue
+        fm = _FUNC_RE.search(inner)  # Qwen XML
+        if fm:
+            calls.append(_xml_tool_call(fm.group(1), fm.group(2)))
+        else:
             calls.append(
                 ToolCall(
                     id=cid,
-                    function=str(obj.get("name", "")),
-                    arguments=obj.get("arguments", {}) or {},
+                    function="",
+                    arguments={},
+                    parse_error="unrecognized tool_call",
                 )
             )
-        except (json.JSONDecodeError, TypeError) as e:
-            calls.append(
-                ToolCall(id=cid, function="", arguments={}, parse_error=str(e))
-            )
-    content = _TOOLCALL_RE.sub("", text).strip()
+
+    # Some variants emit bare <function=..> blocks with no <tool_call> wrapper.
+    if not calls:
+        calls = [_xml_tool_call(fn, body) for fn, body in _FUNC_RE.findall(text)]
+
+    content = _FUNC_RE.sub("", _TOOLCALL_RE.sub("", text)).strip()
     return content, calls
 
 
