@@ -177,6 +177,16 @@ class TinkerAPI(ModelAPI):
 
     def _render(self, input: list[Any], tools: list[ToolInfo], drop_tools: bool):
         msgs = [message_to_template(m) for m in input]
+        # Qwen's chat template requires a single system message at the very start.
+        # Control policies can inject the side-task system prompt mid-conversation,
+        # so merge every system message into one leading block and keep the rest in
+        # order — otherwise the template raises "System message must be at the beginning".
+        sys_parts = [
+            m["content"] for m in msgs if m.get("role") == "system" and m.get("content")
+        ]
+        if sys_parts:
+            rest = [m for m in msgs if m.get("role") != "system"]
+            msgs = [{"role": "system", "content": "\n\n".join(sys_parts)}] + rest
         schemas = None if drop_tools else ([tool_to_schema(t) for t in tools] or None)
         try:
             text = self.tokenizer.apply_chat_template(

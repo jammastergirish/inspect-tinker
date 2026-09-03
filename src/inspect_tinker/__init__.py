@@ -14,7 +14,7 @@ from .provider import (
     tool_to_schema,
 )
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 __all__ = [
     "DEFAULT_BASE_MODEL",
     "TinkerAPI",
