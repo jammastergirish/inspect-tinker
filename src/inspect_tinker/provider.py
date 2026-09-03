@@ -34,6 +34,10 @@ from inspect_ai.tool import ToolCall, ToolChoice, ToolInfo
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-9B"
 TURN_END = "<|im_end|>"  # Qwen assistant-turn terminator
+DEFAULT_MAX_CONTEXT = (
+    65536  # model context window (override: INSPECT_TINKER_MAX_CONTEXT)
+)
+_CONTEXT_RESERVE = 1024  # tokens kept free for generation when fitting the prompt
 
 # Hermes / Qwen tool-call block: <tool_call>{"name": ..., "arguments": {...}}</tool_call>
 # Qwen emits tool calls in two syntaxes; we parse both:
@@ -208,19 +212,7 @@ class TinkerAPI(ModelAPI):
                 )
         return self._sampler
 
-    def _render(self, input: list[Any], tools: list[ToolInfo], drop_tools: bool):
-        msgs = [message_to_template(m) for m in input]
-        # Qwen's chat template requires a single system message at the very start.
-        # Control policies can inject the side-task system prompt mid-conversation,
-        # so merge every system message into one leading block and keep the rest in
-        # order — otherwise the template raises "System message must be at the beginning".
-        sys_parts = [
-            m["content"] for m in msgs if m.get("role") == "system" and m.get("content")
-        ]
-        if sys_parts:
-            rest = [m for m in msgs if m.get("role") != "system"]
-            msgs = [{"role": "system", "content": "\n\n".join(sys_parts)}] + rest
-        schemas = None if drop_tools else ([tool_to_schema(t) for t in tools] or None)
+    def _encode(self, msgs: list[dict], schemas: list[dict] | None) -> list[int]:
         try:
             text = self.tokenizer.apply_chat_template(
                 msgs,
@@ -236,6 +228,37 @@ class TinkerAPI(ModelAPI):
             )
         return self.tokenizer.encode(text, add_special_tokens=False)
 
+    def _render(self, input: list[Any], tools: list[ToolInfo], drop_tools: bool):
+        msgs = [message_to_template(m) for m in input]
+        # Qwen's chat template requires a single system message at the very start.
+        # Control policies can inject the side-task system prompt mid-conversation,
+        # so merge every system message into one leading block and keep the rest in
+        # order — otherwise the template raises "System message must be at the beginning".
+        sys_parts = [
+            m["content"] for m in msgs if m.get("role") == "system" and m.get("content")
+        ]
+        head = (
+            [{"role": "system", "content": "\n\n".join(sys_parts)}] if sys_parts else []
+        )
+        rest = [m for m in msgs if m.get("role") != "system"]
+        schemas = None if drop_tools else ([tool_to_schema(t) for t in tools] or None)
+
+        # Fit the prompt inside the model's context window: keep the system block and
+        # the most recent turns, dropping the oldest (and any orphaned leading tool
+        # result) until it fits with room to generate. Long agentic episodes otherwise
+        # overflow and Tinker returns a 400. Override the window with
+        # INSPECT_TINKER_MAX_CONTEXT if the served model differs from the default.
+        ctx = int(
+            os.environ.get("INSPECT_TINKER_MAX_CONTEXT", str(DEFAULT_MAX_CONTEXT))
+        )
+        ids = self._encode(head + rest, schemas)
+        while len(ids) > ctx - _CONTEXT_RESERVE and rest:
+            rest = rest[1:]
+            while rest and rest[0].get("role") == "tool":
+                rest = rest[1:]  # don't leave a tool result with no preceding call
+            ids = self._encode(head + rest, schemas)
+        return ids
+
     async def generate(
         self,
         input: list[Any],
@@ -250,7 +273,12 @@ class TinkerAPI(ModelAPI):
         stop = list(config.stop_seqs or [])
         if TURN_END not in stop:
             stop.append(TURN_END)
-        max_tokens = config.max_tokens or 1024
+        # Cap generation so prompt + max_tokens stays inside the context window
+        # (_render already trims the prompt to leave room).
+        ctx = int(
+            os.environ.get("INSPECT_TINKER_MAX_CONTEXT", str(DEFAULT_MAX_CONTEXT))
+        )
+        max_tokens = max(16, min(config.max_tokens or 1024, ctx - len(ids) - 8))
         params = types.SamplingParams(
             max_tokens=max_tokens,
             temperature=0.0 if config.temperature is None else config.temperature,
