@@ -64,7 +64,29 @@ uv run ct run eval --no-upload --policy attack \
 ```
 
 ControlTower passes unknown provider prefixes straight through to Inspect, so no
-fork or config change is needed — just install this package alongside it.
+fork is needed. **But mind *where* the eval runs.**
+
+### Isolated settings (important)
+
+A setting whose `pyproject.toml` declares `control-tower` (e.g. **basharena**) is
+*isolated*: ControlTower runs its eval in the setting's **own** uv environment
+(`uv run --project .settings/<setting>`), not in ControlTower's env. Installing this
+package alongside ControlTower is then **not enough** — the isolated env won't have it,
+and you'll get `Model API tinker … not recognized`. Install it into the setting's env:
+
+```bash
+uv --project .settings/<setting> add --editable /path/to/inspect-tinker
+```
+
+Two resolution snags to expect there:
+
+- **inspect-ai floor.** A setting may pin an older inspect-ai than ControlTower
+  (basharena pins `0.3.255`). This package's floor is deliberately low (`>=0.3.255`) to
+  fit; if you tighten it, you'll break isolated settings that pin older.
+- **Platform lock.** A setting's *universal* lock can target platforms where `tinker`
+  has no wheels (e.g. win32), making the add "unsatisfiable for an environment that is
+  not the current one." Restrict the setting's **local** lock to your platform — add to
+  its `[tool.uv]`: `environments = ["sys_platform == 'darwin'"]` (or your own).
 
 ## Notes & limitations
 
@@ -73,6 +95,11 @@ fork or config change is needed — just install this package alongside it.
   emit a different tool-call syntax would need a different parser.
 - **Sampling params.** `max_tokens`, `temperature`, `top_p`, and `stop` from the
   eval's `GenerateConfig` are forwarded; `<|im_end|>` is always added as a stop.
+- **System-message order.** Qwen's template requires a single system message at the
+  very start, but control policies often inject the side-task system prompt
+  mid-conversation. The provider merges every system message into one leading block
+  (preserving the order of the rest) so the template doesn't raise "System message must
+  be at the beginning."
 - **Thinking.** Off by default (matches an actions-only SFT). Pass
   `-M enable_thinking=true` to enable it if your base template supports it.
 - **One checkpoint per model handle.** Point at a different `tinker://` path to
