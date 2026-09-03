@@ -48,6 +48,15 @@ _TOOLCALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 _FUNC_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
 _PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
 
+# GLM (zai-org/GLM-*) tool call: the function name sits bare after <tool_call>, then
+# <arg_key>/<arg_value> pairs, e.g.
+#   <tool_call>bash<arg_key>cmd</arg_key><arg_value>ls -la</arg_value></tool_call>
+_GLM_ARG_RE = re.compile(
+    r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>", re.DOTALL
+)
+# GLM emits a (usually empty, since we train no-CoT) reasoning block before the call.
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
 
 # --------------------------------------------------------------------------- #
 # Pure helpers (no network / no tokenizer) — unit-tested in tests/.
@@ -102,14 +111,24 @@ def _xml_tool_call(fname: str, body: str) -> ToolCall:
     return ToolCall(id=uuid.uuid4().hex[:8], function=fname.strip(), arguments=args)
 
 
-def parse_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
-    """Split Qwen/Hermes output into (content, tool_calls).
+def _glm_tool_call(inner: str) -> ToolCall:
+    """Build a ToolCall from a GLM <tool_call> body: the bare function name, then
+    <arg_key>/<arg_value> pairs. A call with no arguments is just the name."""
+    fname = inner.split("<arg_key>", 1)[0].strip()
+    args = {k.strip(): v.strip() for k, v in _GLM_ARG_RE.findall(inner)}
+    return ToolCall(id=uuid.uuid4().hex[:8], function=fname, arguments=args)
 
-    Handles both syntaxes Qwen emits — Hermes JSON
-    (``<tool_call>{"name":..,"arguments":{..}}</tool_call>``) and the Qwen XML form
+
+def parse_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
+    """Split Qwen/Hermes/GLM output into (content, tool_calls).
+
+    Handles the three syntaxes these models emit — Hermes JSON
+    (``<tool_call>{"name":..,"arguments":{..}}</tool_call>``), the Qwen XML form
     (``<tool_call><function=NAME><parameter=KEY>VALUE</parameter>..</function></tool_call>``,
-    which Qwen3.5 uses). Malformed blocks are preserved with a ``parse_error`` rather
-    than dropped. The remaining text (blocks removed) is the assistant content.
+    which Qwen3.5 uses), and the GLM form
+    (``<tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>..</tool_call>``).
+    A leading ``<think>..</think>`` reasoning block is stripped from the content.
+    Malformed blocks are preserved with a ``parse_error`` rather than dropped.
     """
     calls: list[ToolCall] = []
     for m in _TOOLCALL_RE.finditer(text):
@@ -130,24 +149,29 @@ def parse_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
                     ToolCall(id=cid, function="", arguments={}, parse_error=str(e))
                 )
             continue
-        fm = _FUNC_RE.search(inner)  # Qwen XML
-        if fm:
-            calls.append(_xml_tool_call(fm.group(1), fm.group(2)))
-        else:
-            calls.append(
-                ToolCall(
-                    id=cid,
-                    function="",
-                    arguments={},
-                    parse_error="unrecognized tool_call",
-                )
+        if "<function=" in inner:  # Qwen XML
+            fm = _FUNC_RE.search(inner)
+            if fm:
+                calls.append(_xml_tool_call(fm.group(1), fm.group(2)))
+                continue
+        if "<arg_key>" in inner or "<arg_value>" in inner:  # GLM key/value pairs
+            calls.append(_glm_tool_call(inner))
+            continue
+        if inner and "<" not in inner:  # GLM no-arg call: <tool_call>NAME</tool_call>
+            calls.append(ToolCall(id=cid, function=inner, arguments={}))
+            continue
+        calls.append(
+            ToolCall(
+                id=cid, function="", arguments={}, parse_error="unrecognized tool_call"
             )
+        )
 
     # Some variants emit bare <function=..> blocks with no <tool_call> wrapper.
     if not calls:
         calls = [_xml_tool_call(fn, body) for fn, body in _FUNC_RE.findall(text)]
 
-    content = _FUNC_RE.sub("", _TOOLCALL_RE.sub("", text)).strip()
+    # Strip tool-call blocks and any (usually empty) GLM/Qwen reasoning block.
+    content = _THINK_RE.sub("", _FUNC_RE.sub("", _TOOLCALL_RE.sub("", text))).strip()
     return content, calls
 
 
@@ -191,9 +215,21 @@ class TinkerAPI(ModelAPI):
             )
         self.enable_thinking = bool(enable_thinking)
 
+        # GLM (zai-org/GLM-*) uses a different chat format and turn terminators than
+        # Qwen: an assistant turn ends at <|user|>/<|observation|>, not <|im_end|>.
+        self.is_glm = "glm" in self.base_model.lower()
+        self._turn_stops = (
+            ["<|user|>", "<|observation|>"] if self.is_glm else [TURN_END]
+        )
+
+        # A Tinker base id may carry a ":peft:<ctx>" suffix (required to *sample* some
+        # models, e.g. GLM-5.3) that is not a valid HF id — strip it for the tokenizer,
+        # keep the full id for the Tinker sampling client.
+        self.tokenizer_id = self.base_model.split(":peft:")[0]
+
         from transformers import AutoTokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.base_model)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_id)
 
         import tinker
 
@@ -271,8 +307,9 @@ class TinkerAPI(ModelAPI):
         ids = self._render(input, tools, drop_tools=(tool_choice == "none"))
 
         stop = list(config.stop_seqs or [])
-        if TURN_END not in stop:
-            stop.append(TURN_END)
+        for t in self._turn_stops:
+            if t not in stop:
+                stop.append(t)
         # Cap generation so prompt + max_tokens stays inside the context window
         # (_render already trims the prompt to leave room).
         ctx = int(

@@ -117,6 +117,39 @@ def test_parse_qwen_xml_multi_parameter():
     }
 
 
+def test_parse_glm_tool_call():
+    # GLM emits: <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>
+    text = (
+        "<tool_call>bash<arg_key>cmd</arg_key><arg_value>ls -la</arg_value></tool_call>"
+    )
+    content, calls = parse_tool_calls(text)
+    assert content == ""
+    assert len(calls) == 1
+    assert calls[0].function == "bash"
+    assert calls[0].arguments == {"cmd": "ls -la"}
+
+
+def test_parse_glm_multi_param_and_strips_think():
+    # A (typically empty, no-CoT) <think> block precedes the call and is stripped.
+    text = (
+        "<think></think><tool_call>text_editor"
+        "<arg_key>command</arg_key><arg_value>str_replace</arg_value>"
+        "<arg_key>path</arg_key><arg_value>/etc/x</arg_value></tool_call>"
+    )
+    content, calls = parse_tool_calls(text)
+    assert content == ""
+    assert calls[0].function == "text_editor"
+    assert calls[0].arguments == {"command": "str_replace", "path": "/etc/x"}
+
+
+def test_parse_glm_no_arg_call():
+    content, calls = parse_tool_calls("<tool_call>submit</tool_call>")
+    assert len(calls) == 1
+    assert calls[0].function == "submit"
+    assert calls[0].arguments == {}
+    assert calls[0].parse_error is None
+
+
 def test_parse_no_tool_calls():
     content, calls = parse_tool_calls("just some prose, no calls")
     assert content == "just some prose, no calls"

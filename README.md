@@ -8,7 +8,7 @@ addressed as `tinker/<checkpoint-path>`.
 
 **No local GPU.** The provider renders Inspect's messages + tools with the base
 model's chat template, calls Tinker's `sample_async` (Tinker's servers do the
-compute), and parses the model's Hermes/Qwen-style `<tool_call>` output back into
+compute), and parses the model's Hermes/Qwen/GLM-style `<tool_call>` output back into
 Inspect `ToolCall`s.
 
 ## Why
@@ -90,11 +90,18 @@ Two resolution snags to expect there:
 
 ## Notes & limitations
 
-- **Tool-call format.** Output is parsed as Hermes/Qwen `<tool_call>{json}</tool_call>`
-  blocks (matching `--tool-call-parser hermes`). Models from other families that
-  emit a different tool-call syntax would need a different parser.
+- **Tool-call format.** Three syntaxes are parsed: Hermes JSON
+  (`<tool_call>{json}</tool_call>`), Qwen XML
+  (`<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`), and GLM
+  (`<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`). A leading
+  `<think>…</think>` block is stripped from the assistant content. Other families that emit
+  yet another syntax would need a further parser arm.
+- **Model family.** Detected from the base-model id: `zai-org/GLM-*` uses GLM's chat format
+  and turn terminators (`<|user|>`/`<|observation|>`); everything else defaults to Qwen
+  (`<|im_end|>`).
 - **Sampling params.** `max_tokens`, `temperature`, `top_p`, and `stop` from the
-  eval's `GenerateConfig` are forwarded; `<|im_end|>` is always added as a stop.
+  eval's `GenerateConfig` are forwarded; the family's turn terminator(s) are always added
+  as stops.
 - **System-message order.** Qwen's template requires a single system message at the
   very start, but control policies often inject the side-task system prompt
   mid-conversation. The provider merges every system message into one leading block
