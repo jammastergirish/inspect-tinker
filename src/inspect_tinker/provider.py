@@ -119,8 +119,50 @@ def _glm_tool_call(inner: str) -> ToolCall:
     return ToolCall(id=uuid.uuid4().hex[:8], function=fname, arguments=args)
 
 
+_INK_START = re.compile(r'\{\s*"name"\s*:')
+
+
+def _inkling_tool_calls(text: str) -> tuple[list[ToolCall], str]:
+    """Inkling (thinkingmachines/Inkling) emits tool calls inline with no wrapper, as
+    ``NAME{"name":"NAME","args":{...}}``. Pull each JSON object out (balanced, via
+    ``raw_decode`` so braces inside a command don't break it) and strip it — plus the
+    duplicated bare tool-name token right before it — from the returned content."""
+    dec = json.JSONDecoder()
+    calls: list[ToolCall] = []
+    out: list[str] = []
+    i = 0
+    for m in _INK_START.finditer(text):
+        j = m.start()
+        if j < i:
+            continue
+        try:
+            obj, end = dec.raw_decode(text, j)
+        except json.JSONDecodeError:
+            continue
+        if not (
+            isinstance(obj, dict)
+            and "name" in obj
+            and ("args" in obj or "arguments" in obj)
+        ):
+            continue
+        args = obj.get("args", obj.get("arguments")) or {}
+        calls.append(
+            ToolCall(
+                id=uuid.uuid4().hex[:8],
+                function=str(obj.get("name", "")),
+                arguments=args if isinstance(args, dict) else {},
+            )
+        )
+        out.append(
+            re.sub(r"\w+\s*$", "", text[i:j])
+        )  # drop the bare "bash" before the blob
+        i = end
+    out.append(text[i:])
+    return calls, "".join(out).strip()
+
+
 def parse_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
-    """Split Qwen/Hermes/GLM output into (content, tool_calls).
+    """Split Qwen/Hermes/GLM/Inkling output into (content, tool_calls).
 
     Handles the three syntaxes these models emit — Hermes JSON
     (``<tool_call>{"name":..,"arguments":{..}}</tool_call>``), the Qwen XML form
@@ -169,6 +211,13 @@ def parse_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
     # Some variants emit bare <function=..> blocks with no <tool_call> wrapper.
     if not calls:
         calls = [_xml_tool_call(fn, body) for fn, body in _FUNC_RE.findall(text)]
+
+    # Inkling: no wrapper at all — NAME{"name":..,"args":{..}} inline. Only as a last resort,
+    # so it can never disturb the Qwen/GLM paths above.
+    if not calls and '"name"' in text and ('"args"' in text or '"arguments"' in text):
+        ink_calls, ink_content = _inkling_tool_calls(text)
+        if ink_calls:
+            return ink_content, ink_calls
 
     # Strip tool-call blocks and any (usually empty) GLM/Qwen reasoning block.
     content = _THINK_RE.sub("", _FUNC_RE.sub("", _TOOLCALL_RE.sub("", text))).strip()
