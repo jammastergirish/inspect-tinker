@@ -57,32 +57,58 @@ _GLM_ARG_RE = re.compile(
 # GLM emits a (usually empty, since we train no-CoT) reasoning block before the call.
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
+# Kimi (moonshotai/Kimi-*) tool calls: each call carries a ``functions.NAME:IDX`` id
+# wrapped in special tokens, e.g.
+#   <|tool_calls_section_begin|><|tool_call_begin|>functions.bash:0
+#   <|tool_call_argument_begin|>{"cmd": "ls /home"}<|tool_call_end|><|tool_calls_section_end|>
+# The Tinker server's tokenizer numbers those section tokens differently from the local
+# HF tokenizer, so on the way back they decode to *other* special-token names (the
+# argument/end markers surface as <|im_middle|>/<|media_begin|>, and the begin markers
+# survive verbatim). The ``functions.NAME:IDX`` id and the JSON argument object are
+# ordinary text that decodes faithfully, so we key parsing off those — find each id,
+# then the balanced JSON object after it — rather than trusting the delimiters.
+_KIMI_ID_RE = re.compile(r"functions\.([A-Za-z0-9_.\-]+):(\d+)")
+# Kimi section/call delimiters, plus the tokens the local tokenizer mis-decodes them
+# into; stripped from the returned content.
+_KIMI_MARKER_RE = re.compile(
+    r"<\|(?:tool_calls_section_begin|tool_calls_section_end|tool_call_begin|"
+    r"tool_call_argument_begin|tool_call_end|im_middle|media_begin|media_end|"
+    r"media_content|media_pad)\|>"
+)
+
 
 # --------------------------------------------------------------------------- #
 # Pure helpers (no network / no tokenizer) — unit-tested in tests/.
 # --------------------------------------------------------------------------- #
-def message_to_template(msg: Any) -> dict[str, Any]:
-    """Convert one Inspect ChatMessage into the dict a HF chat template expects."""
+def message_to_template(msg: Any, family: str | None = None) -> dict[str, Any]:
+    """Convert one Inspect ChatMessage into the dict a HF chat template expects.
+
+    ``family`` selects family-specific quirks in how prior turns are rendered back
+    into the prompt. For ``"kimi"`` the chat template prints ``tool_call['id']``
+    verbatim between the call-begin/argument-begin tokens and the model is trained on
+    ids of the form ``functions.NAME:IDX`` — so the function name must be carried in
+    the id or it is lost from the rendered history; tool results likewise reference
+    that id in their ``## Return of ...`` header.
+    """
     role = msg.role
     text = msg.text or ""
     if role == "assistant" and getattr(msg, "tool_calls", None):
-        return {
-            "role": "assistant",
-            "content": text,
-            "tool_calls": [
-                {
-                    "type": "function",
-                    "function": {"name": tc.function, "arguments": tc.arguments},
-                }
-                for tc in msg.tool_calls
-            ],
-        }
+        tool_calls = []
+        for idx, tc in enumerate(msg.tool_calls):
+            entry: dict[str, Any] = {
+                "type": "function",
+                "function": {"name": tc.function, "arguments": tc.arguments},
+            }
+            if family == "kimi":
+                entry["id"] = f"functions.{tc.function}:{idx}"
+            tool_calls.append(entry)
+        return {"role": "assistant", "content": text, "tool_calls": tool_calls}
     if role == "tool":
-        return {
-            "role": "tool",
-            "content": text,
-            "name": getattr(msg, "function", None) or "",
-        }
+        name = getattr(msg, "function", None) or ""
+        out: dict[str, Any] = {"role": "tool", "content": text, "name": name}
+        if family == "kimi":
+            out["tool_call_id"] = f"functions.{name}:0"
+        return out
     return {"role": role, "content": text}
 
 
@@ -161,17 +187,77 @@ def _inkling_tool_calls(text: str) -> tuple[list[ToolCall], str]:
     return calls, "".join(out).strip()
 
 
-def parse_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
-    """Split Qwen/Hermes/GLM/Inkling output into (content, tool_calls).
+def _kimi_tool_calls(text: str) -> tuple[list[ToolCall], str]:
+    """Kimi (moonshotai/Kimi-*) emits each tool call as a ``functions.NAME:IDX`` id
+    followed by a JSON argument object, wrapped in ``<|tool_call...|>`` section tokens.
+    Those delimiter tokens are unreliable here (the server tokenizer numbers them
+    differently from the local one, so they decode to mismatched names), but the id and
+    the JSON are plain text that decodes faithfully — so key off each id, then pull the
+    balanced JSON object that follows (via ``raw_decode``, so braces inside a string
+    don't break it). A block whose arguments won't parse is preserved with a
+    ``parse_error`` rather than dropped, and the (usually empty) content before the
+    first call is returned separately with the section tokens stripped."""
+    dec = json.JSONDecoder()
+    ids = list(_KIMI_ID_RE.finditer(text))
+    calls: list[ToolCall] = []
+    for n, m in enumerate(ids):
+        fname = m.group(1)
+        cid = uuid.uuid4().hex[:8]
+        # The args JSON lives between this id and the next one (or the end).
+        seg_end = ids[n + 1].start() if n + 1 < len(ids) else len(text)
+        segment = text[m.end() : seg_end]
+        brace = segment.find("{")  # skip any delimiter tokens between id and args
+        if brace == -1:
+            calls.append(
+                ToolCall(
+                    id=cid,
+                    function=fname,
+                    arguments={},
+                    parse_error="no JSON argument object found",
+                )
+            )
+            continue
+        try:
+            obj, _ = dec.raw_decode(segment, brace)
+            if not isinstance(obj, dict):
+                raise TypeError("tool-call arguments were not a JSON object")
+            calls.append(ToolCall(id=cid, function=fname, arguments=obj))
+        except (json.JSONDecodeError, TypeError) as e:
+            calls.append(
+                ToolCall(id=cid, function=fname, arguments={}, parse_error=str(e))
+            )
 
-    Handles the three syntaxes these models emit — Hermes JSON
+    if not ids:
+        return [], text
+    # Content is whatever precedes the first tool-call indicator (a section token or the
+    # first id), with any leftover reasoning/section tokens stripped.
+    cut = ids[0].start()
+    for mark in _KIMI_MARKER_RE.finditer(text):
+        cut = min(cut, mark.start())
+    content = _KIMI_MARKER_RE.sub("", _THINK_RE.sub("", text[:cut])).strip()
+    return calls, content
+
+
+def parse_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
+    """Split Qwen/Hermes/GLM/Inkling/Kimi output into (content, tool_calls).
+
+    Handles the syntaxes these models emit — Hermes JSON
     (``<tool_call>{"name":..,"arguments":{..}}</tool_call>``), the Qwen XML form
     (``<tool_call><function=NAME><parameter=KEY>VALUE</parameter>..</function></tool_call>``,
-    which Qwen3.5 uses), and the GLM form
-    (``<tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>..</tool_call>``).
-    A leading ``<think>..</think>`` reasoning block is stripped from the content.
-    Malformed blocks are preserved with a ``parse_error`` rather than dropped.
+    which Qwen3.5 uses), the GLM form
+    (``<tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>..</tool_call>``),
+    and the Kimi form (a ``functions.NAME:IDX`` id + JSON args inside ``<|tool_call...|>``
+    section tokens). A leading ``<think>..</think>`` reasoning block is stripped from the
+    content. Malformed blocks are preserved with a ``parse_error`` rather than dropped.
     """
+    # Kimi (moonshotai/Kimi-*): a functions.NAME:IDX id followed by JSON args. Its syntax
+    # shares no markers with the Qwen/GLM/Inkling forms, so detect it up front and only
+    # take this path when it actually yields calls.
+    if _KIMI_ID_RE.search(text):
+        kimi_calls, kimi_content = _kimi_tool_calls(text)
+        if kimi_calls:
+            return kimi_content, kimi_calls
+
     calls: list[ToolCall] = []
     for m in _TOOLCALL_RE.finditer(text):
         inner = m.group(1).strip()
@@ -264,9 +350,16 @@ class TinkerAPI(ModelAPI):
             )
         self.enable_thinking = bool(enable_thinking)
 
-        # GLM (zai-org/GLM-*) uses a different chat format and turn terminators than
-        # Qwen: an assistant turn ends at <|user|>/<|observation|>, not <|im_end|>.
+        # Detect the base model's family from its id; it selects the chat format, the
+        # turn terminators, and how tool calls are rendered/parsed.
+        #   GLM (zai-org/GLM-*): an assistant turn ends at <|user|>/<|observation|>, not
+        #     <|im_end|>, and tool calls use <arg_key>/<arg_value> pairs.
+        #   Kimi (moonshotai/Kimi-*): ends at <|im_end|> like Qwen, but declares tools in a
+        #     tool_declare block, gates reasoning on `thinking`, and emits functions.NAME:IDX
+        #     tool-call ids.
         self.is_glm = "glm" in self.base_model.lower()
+        self.is_kimi = "kimi" in self.base_model.lower()
+        self.family = "glm" if self.is_glm else ("kimi" if self.is_kimi else None)
         self._turn_stops = (
             ["<|user|>", "<|observation|>"] if self.is_glm else [TURN_END]
         )
@@ -298,23 +391,27 @@ class TinkerAPI(ModelAPI):
         return self._sampler
 
     def _encode(self, msgs: list[dict], schemas: list[dict] | None) -> list[int]:
+        # Qwen/GLM templates gate reasoning on `enable_thinking`; Kimi's gates it on
+        # `thinking`. Pass both so the (default no-CoT) behaviour is honoured everywhere;
+        # a template ignores the kwarg it doesn't use.
+        kwargs: dict[str, Any] = {
+            "add_generation_prompt": True,
+            "tokenize": False,
+            "enable_thinking": self.enable_thinking,
+        }
+        if self.is_kimi:
+            kwargs["thinking"] = self.enable_thinking
         try:
-            text = self.tokenizer.apply_chat_template(
-                msgs,
-                tools=schemas,
-                add_generation_prompt=True,
-                tokenize=False,
-                enable_thinking=self.enable_thinking,
-            )
+            text = self.tokenizer.apply_chat_template(msgs, tools=schemas, **kwargs)
         except TypeError:
-            # tokenizer template doesn't accept enable_thinking
+            # tokenizer template doesn't accept the thinking kwargs
             text = self.tokenizer.apply_chat_template(
                 msgs, tools=schemas, add_generation_prompt=True, tokenize=False
             )
         return self.tokenizer.encode(text, add_special_tokens=False)
 
     def _render(self, input: list[Any], tools: list[ToolInfo], drop_tools: bool):
-        msgs = [message_to_template(m) for m in input]
+        msgs = [message_to_template(m, self.family) for m in input]
         # Qwen's chat template requires a single system message at the very start.
         # Control policies can inject the side-task system prompt mid-conversation,
         # so merge every system message into one leading block and keep the rest in

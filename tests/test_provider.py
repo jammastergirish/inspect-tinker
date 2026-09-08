@@ -150,6 +150,127 @@ def test_parse_glm_no_arg_call():
     assert calls[0].parse_error is None
 
 
+# ---- Kimi (moonshotai/Kimi-*) tool-call parsing ---------------------------
+# Kimi emits each call as a ``functions.NAME:IDX`` id followed by a JSON argument
+# object, wrapped in <|tool_call...|> section tokens. Tinker's server tokenizer
+# numbers those section tokens differently from the local HF tokenizer, so on the way
+# back the argument/end markers decode to <|im_middle|>/<|media_begin|> while the
+# begin markers survive verbatim; the strings below are the REAL decoded output.
+def test_parse_kimi_tool_call():
+    text = (
+        "<|tool_call_begin|><|tool_call_end|>functions.bash:0"
+        '{"cmd": "ls /home"}<|tool_call_argument_begin|>'
+    )
+    content, calls = parse_tool_calls(text)
+    assert content == ""
+    assert len(calls) == 1
+    assert calls[0].function == "bash"
+    assert calls[0].arguments == {"cmd": "ls /home"}
+    assert calls[0].parse_error is None
+
+
+def test_parse_kimi_tool_call_skip_special_false():
+    # If the delimiters are preserved on decode, the real arg marker surfaces as
+    # <|im_middle|>; the parser skips it to find the JSON.
+    text = (
+        "<|tool_call_begin|><|tool_call_end|>functions.bash:0<|im_middle|>"
+        '{"cmd": "ls /home"}<|media_begin|><|tool_call_argument_begin|>'
+    )
+    _, calls = parse_tool_calls(text)
+    assert calls[0].function == "bash"
+    assert calls[0].arguments == {"cmd": "ls /home"}
+
+
+def test_parse_kimi_multi_parameter():
+    text = (
+        "<|tool_call_begin|><|tool_call_end|>functions.text_editor:0"
+        '{"command": "str_replace", "path": "/etc/x", "old_str": "a", "new_str": "b"}'
+        "<|tool_call_argument_begin|>"
+    )
+    _, calls = parse_tool_calls(text)
+    assert calls[0].function == "text_editor"
+    assert calls[0].arguments == {
+        "command": "str_replace",
+        "path": "/etc/x",
+        "old_str": "a",
+        "new_str": "b",
+    }
+
+
+def test_parse_kimi_no_arg_call():
+    text = (
+        "<|tool_call_begin|><|tool_call_end|>functions.submit:0{}"
+        "<|tool_call_argument_begin|>"
+    )
+    content, calls = parse_tool_calls(text)
+    assert content == ""
+    assert len(calls) == 1
+    assert calls[0].function == "submit"
+    assert calls[0].arguments == {}
+    assert calls[0].parse_error is None
+
+
+def test_parse_kimi_multiple_tool_calls():
+    text = (
+        "<|tool_call_begin|><|tool_call_end|>functions.bash:0"
+        '{"cmd": "ls ~"}<|tool_call_end|>functions.read_file:1'
+        '{"path": "/etc/hostname"}<|tool_call_argument_begin|>'
+    )
+    content, calls = parse_tool_calls(text)
+    assert content == ""
+    assert [c.function for c in calls] == ["bash", "read_file"]
+    assert calls[0].arguments == {"cmd": "ls ~"}
+    assert calls[1].arguments == {"path": "/etc/hostname"}
+
+
+def test_parse_kimi_content_then_call():
+    text = (
+        "Let me check the files.<|tool_call_begin|><|tool_call_end|>"
+        'functions.bash:0{"cmd": "ls"}<|tool_call_argument_begin|>'
+    )
+    content, calls = parse_tool_calls(text)
+    assert content == "Let me check the files."
+    assert calls[0].function == "bash"
+    assert calls[0].arguments == {"cmd": "ls"}
+
+
+def test_parse_kimi_malformed_records_error():
+    # Truncated JSON: the call is preserved with a parse_error and the name is kept.
+    text = '<|tool_call_begin|><|tool_call_end|>functions.bash:0{"cmd": "ls'
+    _, calls = parse_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].function == "bash"
+    assert calls[0].parse_error is not None
+    assert calls[0].arguments == {}
+
+
+def test_kimi_message_rendering_embeds_function_name():
+    # Kimi's chat template prints tool_call['id'] between the call-begin/argument-begin
+    # tokens, so the function name must be carried there as functions.NAME:IDX or it is
+    # lost from the rendered history. The tool result references the same id.
+    assistant = ChatMessageAssistant(
+        content="",
+        tool_calls=[ToolCall(id="c1", function="bash", arguments={"cmd": "ls"})],
+    )
+    rendered = message_to_template(assistant, family="kimi")
+    assert rendered["tool_calls"][0]["id"] == "functions.bash:0"
+    assert rendered["tool_calls"][0]["function"] == {
+        "name": "bash",
+        "arguments": {"cmd": "ls"},
+    }
+    tool = ChatMessageTool(content="alice", tool_call_id="c1", function="bash")
+    assert message_to_template(tool, family="kimi") == {
+        "role": "tool",
+        "content": "alice",
+        "name": "bash",
+        "tool_call_id": "functions.bash:0",
+    }
+    # Without the kimi family, the id/tool_call_id are not injected (other templates
+    # read function.name directly).
+    assert "id" not in message_to_template(assistant)["tool_calls"][0]
+    assert "tool_call_id" not in message_to_template(tool)
+
+
 def test_parse_no_tool_calls():
     content, calls = parse_tool_calls("just some prose, no calls")
     assert content == "just some prose, no calls"

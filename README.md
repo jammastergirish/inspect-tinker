@@ -8,8 +8,8 @@ addressed as `tinker/<checkpoint-path>`.
 
 **No local GPU.** The provider renders Inspect's messages + tools with the base
 model's chat template, calls Tinker's `sample_async` (Tinker's servers do the
-compute), and parses the model's Hermes/Qwen/GLM-style `<tool_call>` output back into
-Inspect `ToolCall`s.
+compute), and parses the model's Hermes/Qwen/GLM/Inkling/Kimi-style tool-call output
+back into Inspect `ToolCall`s.
 
 ## Why
 
@@ -90,15 +90,20 @@ Two resolution snags to expect there:
 
 ## Notes & limitations
 
-- **Tool-call format.** Three syntaxes are parsed: Hermes JSON
+- **Tool-call format.** Several syntaxes are parsed: Hermes JSON
   (`<tool_call>{json}</tool_call>`), Qwen XML
-  (`<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`), and GLM
-  (`<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`). A leading
-  `<think>…</think>` block is stripped from the assistant content. Other families that emit
-  yet another syntax would need a further parser arm.
+  (`<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`), GLM
+  (`<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`), Inkling
+  (unwrapped `NAME{"name":..,"args":{..}}`), and Kimi (a `functions.NAME:IDX` id + JSON args
+  inside `<|tool_call…|>` section tokens). A leading `<think>…</think>` block is stripped from
+  the assistant content. Other families that emit yet another syntax would need a further
+  parser arm.
 - **Model family.** Detected from the base-model id: `zai-org/GLM-*` uses GLM's chat format
-  and turn terminators (`<|user|>`/`<|observation|>`); everything else defaults to Qwen
-  (`<|im_end|>`).
+  and turn terminators (`<|user|>`/`<|observation|>`); `moonshotai/Kimi-*` uses Kimi's chat
+  format (a `tool_declare` schema block, reasoning gated on `thinking`, and `functions.NAME:IDX`
+  tool-call ids) while ending turns at `<|im_end|>`; everything else defaults to Qwen
+  (`<|im_end|>`). Note that a Kimi base id must carry the `:peft:<ctx>` suffix to sample
+  (e.g. `moonshotai/Kimi-K2.6:peft:131072`), stripped for the tokenizer.
 - **Sampling params.** `max_tokens`, `temperature`, `top_p`, and `stop` from the
   eval's `GenerateConfig` are forwarded; the family's turn terminator(s) are always added
   as stops.
