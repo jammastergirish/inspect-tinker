@@ -76,6 +76,33 @@ _KIMI_MARKER_RE = re.compile(
     r"media_content|media_pad)\|>"
 )
 
+# gpt-oss (OpenAI *harmony* channel format). A tool call is emitted in the ``commentary``
+# channel as ``<|start|>assistant<|channel|>commentary to=functions.NAME <|constrain|>json
+# <|message|>{...}<|call|>``; reasoning goes to ``analysis`` and the user-facing answer to
+# ``final``. On the Tinker serving path the harmony special tokens (``<|start|>``,
+# ``<|channel|>``, ``<|message|>``, ``<|constrain|>``, ``<|call|>``, ``<|end|>``) decode
+# WITHOUT their delimiters, so the channels collapse into bare words: the completion opens
+# on ``analysis<reasoning>``, a tool call surfaces as
+# ``assistantcommentary to=functions.NAME json{...}`` (the ``assistant`` is the role token
+# from ``<|start|>assistant``, and the ``json`` constrain may abut the name, e.g.
+# ``to=functions.submitjson{}``), and the answer as ``assistantfinal<text>``. The
+# ``to=functions.`` recipient and the balanced JSON object decode faithfully, so we key
+# extraction off those (raw_decode for the args, robust to nested/brace-like text) rather
+# than trusting the collapsed delimiters.
+_HARMONY_RECIPIENT_RE = re.compile(r"to=functions\.([A-Za-z0-9_.\-]+)")
+# Between the recipient and its ``{`` args only the (optional) ``json`` constrain and
+# whitespace may sit; anything else means the ``{`` isn't this call's argument object.
+_HARMONY_GAP_RE = re.compile(r"\s*(?:json)?\s*")
+# Channel-marker words in collapsed harmony output: the leading channel word (the
+# ``<|start|>assistant`` sat in the prompt, so the completion opens bare) and every later
+# channel introduced by the ``assistant`` role token glued to its channel name. Used to
+# split the residual analysis/final prose and — in its glued ``assistant...`` form only —
+# to detect a tool-call-free harmony turn without misfiring on ordinary prose.
+_HARMONY_MARK_RE = re.compile(
+    r"assistant(?:analysis|commentary|final)|^(?:analysis|commentary|final)"
+)
+_HARMONY_ASSISTANT_RE = re.compile(r"assistant(?:analysis|commentary|final)")
+
 
 # --------------------------------------------------------------------------- #
 # Pure helpers (no network / no tokenizer) — unit-tested in tests/.
@@ -238,18 +265,92 @@ def _kimi_tool_calls(text: str) -> tuple[list[ToolCall], str]:
     return calls, content
 
 
+def _harmony_tool_calls(text: str) -> tuple[list[ToolCall], str]:
+    """gpt-oss (OpenAI *harmony*) emits each tool call in the ``commentary`` channel as
+    ``... to=functions.NAME json{...}``; on the Tinker serving path the harmony special
+    tokens decode without their delimiters, so channels collapse into bare words (see the
+    module-level note). Extract every ``to=functions.NAME`` recipient and the balanced JSON
+    object that follows it (via ``raw_decode``, so nested braces / brace-like text inside a
+    string argument don't break it), then return the residual ``analysis``/``final`` prose
+    with those tool-call spans excised and the channel-marker words stripped.
+
+    Args JSON may be ``{}`` or abut the constrain (``to=functions.submitjson{}`` → tool
+    ``submit``). A recipient whose arguments won't parse is preserved with a ``parse_error``
+    rather than dropped. Returns ``([], text)`` unchanged when no recipient is found."""
+    dec = json.JSONDecoder()
+    calls: list[ToolCall] = []
+    out: list[str] = []  # residual prose, with each tool-call span excised
+    i = 0
+    for m in _HARMONY_RECIPIENT_RE.finditer(text):
+        if m.start() < i:
+            continue  # a `to=functions.` sitting inside a prior call's parsed args
+        name = m.group(1)
+        brace = text.find("{", m.end())
+        if brace == -1:
+            continue  # a recipient with no JSON argument object → not a well-formed call
+        gap = text[m.end() : brace]
+        if not _HARMONY_GAP_RE.fullmatch(gap):
+            continue  # only the `json` constrain may sit between recipient and its args
+        # The `json` constrain can abut the tool name (`functions.submitjson{}`); the name
+        # regex greedily swallowed it, so strip a trailing `json` when nothing but the
+        # constrain sits between the recipient and the `{`.
+        if gap.strip() == "" and name.endswith("json") and name != "json":
+            name = name[: -len("json")]
+        cid = uuid.uuid4().hex[:8]
+        try:
+            obj, end = dec.raw_decode(text, brace)
+            if not isinstance(obj, dict):
+                raise TypeError("tool-call arguments were not a JSON object")
+            calls.append(ToolCall(id=cid, function=name, arguments=obj))
+        except (json.JSONDecodeError, TypeError) as e:
+            end = brace
+            calls.append(
+                ToolCall(id=cid, function=name, arguments={}, parse_error=str(e))
+            )
+        out.append(text[i : m.start()])
+        i = end
+    out.append(text[i:])
+    # The residual still carries the channel-marker words (leading analysis/commentary/final
+    # and the glued assistant<channel> markers); split on those and keep the non-empty
+    # analysis/final bodies as content.
+    parts = _HARMONY_MARK_RE.split("".join(out))
+    content = "\n".join(p.strip() for p in parts if p and p.strip())
+    return calls, content
+
+
 def parse_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
-    """Split Qwen/Hermes/GLM/Inkling/Kimi output into (content, tool_calls).
+    """Split Qwen/Hermes/GLM/Inkling/Kimi/gpt-oss output into (content, tool_calls).
 
     Handles the syntaxes these models emit — Hermes JSON
     (``<tool_call>{"name":..,"arguments":{..}}</tool_call>``), the Qwen XML form
     (``<tool_call><function=NAME><parameter=KEY>VALUE</parameter>..</function></tool_call>``,
     which Qwen3.5 uses), the GLM form
     (``<tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>..</tool_call>``),
-    and the Kimi form (a ``functions.NAME:IDX`` id + JSON args inside ``<|tool_call...|>``
-    section tokens). A leading ``<think>..</think>`` reasoning block is stripped from the
-    content. Malformed blocks are preserved with a ``parse_error`` rather than dropped.
+    the Kimi form (a ``functions.NAME:IDX`` id + JSON args inside ``<|tool_call...|>``
+    section tokens), and the gpt-oss/harmony form (``... to=functions.NAME json{...}`` with
+    the harmony channel delimiters decoded away). A leading ``<think>..</think>`` reasoning
+    block is stripped from the content. Malformed blocks are preserved with a ``parse_error``
+    rather than dropped.
+
+    ``parse_tool_calls`` receives only the decoded completion (no family flag), so each
+    family is detected from markers unique to its output; the checks are ordered and gated
+    so a match for one family can't disturb another's parse path.
     """
+    # gpt-oss (OpenAI harmony): the ``to=functions.`` recipient and the glued
+    # ``assistant<channel>`` markers appear in none of the Qwen/Hermes/GLM/Inkling/Kimi
+    # forms, so keying off them is safe. Checked before Kimi because a harmony argument value
+    # could otherwise contain a ``functions.NAME:IDX``-shaped substring and trip Kimi's probe.
+    if "to=functions." in text:
+        harmony_calls, harmony_content = _harmony_tool_calls(text)
+        if harmony_calls:
+            return harmony_content, harmony_calls
+    elif _HARMONY_ASSISTANT_RE.search(text):
+        # A tool-call-free harmony turn (analysis + final, no recipient): strip the channel
+        # markers and return the prose. Gated on the glued ``assistant<channel>`` marker
+        # (not a bare leading channel word) so ordinary prose isn't misread as harmony.
+        _, harmony_content = _harmony_tool_calls(text)
+        return harmony_content, []
+
     # Kimi (moonshotai/Kimi-*): a functions.NAME:IDX id followed by JSON args. Its syntax
     # shares no markers with the Qwen/GLM/Inkling forms, so detect it up front and only
     # take this path when it actually yields calls.
