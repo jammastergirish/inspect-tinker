@@ -348,7 +348,12 @@ class TinkerAPI(ModelAPI):
                 or os.environ.get("INSPECT_TINKER_BASE_MODEL")
                 or DEFAULT_BASE_MODEL
             )
-        self.enable_thinking = bool(enable_thinking)
+        # enable_thinking is a model-arg, but Control Tower's `ct run eval` doesn't expose inspect's
+        # `-M` to set model-args, so also honour an env fallback (set by the agentic-OPD rollout for
+        # CoT-on): INSPECT_TINKER_ENABLE_THINKING=1.
+        self.enable_thinking = bool(enable_thinking) or (
+            os.environ.get("INSPECT_TINKER_ENABLE_THINKING") == "1"
+        )
 
         # Detect the base model's family from its id; it selects the chat format, the
         # turn terminators, and how tool calls are rendered/parsed.
@@ -359,6 +364,7 @@ class TinkerAPI(ModelAPI):
         #     tool-call ids.
         self.is_glm = "glm" in self.base_model.lower()
         self.is_kimi = "kimi" in self.base_model.lower()
+        self.is_inkling = "inkling" in self.base_model.lower()
         self.family = "glm" if self.is_glm else ("kimi" if self.is_kimi else None)
         self._turn_stops = (
             ["<|user|>", "<|observation|>"] if self.is_glm else [TURN_END]
@@ -439,7 +445,10 @@ class TinkerAPI(ModelAPI):
             while rest and rest[0].get("role") == "tool":
                 rest = rest[1:]  # don't leave a tool result with no preceding call
             ids = self._encode(head + rest, schemas)
-        return ids
+        # Also return the final (post-trim) template message dicts and tool schemas, so on-policy
+        # training can re-render the SAME native context (e.g. swapping only the system message for the
+        # OPD teacher) rather than a divergent SFT rendering. Callers that only want ids ignore the rest.
+        return ids, head + rest, schemas
 
     async def generate(
         self,
@@ -450,12 +459,22 @@ class TinkerAPI(ModelAPI):
     ) -> ModelOutput:
         from tinker import types
 
-        ids = self._render(input, tools, drop_tools=(tool_choice == "none"))
+        ids, rendered_msgs, rendered_schemas = self._render(
+            input, tools, drop_tools=(tool_choice == "none")
+        )
 
         stop = list(config.stop_seqs or [])
-        for t in self._turn_stops:
-            if t not in stop:
-                stop.append(t)
+        # Inkling/GLM run tokenizer-less on the Tinker server (skip_tokenizer_init=True — their native
+        # tokenizer routes through the unavailable tml_tokenizers), so it REJECTS *string* stop-sequences
+        # ("stop=[...] is unavailable when skip_tokenizer_init=True (requires tokenizer to decode tokens to
+        # text for matching)") and every sample fails with 0 tokens out. Omit the string turn-stops for those
+        # families and rely on max_tokens + the client-side tool-call parse (parse_tool_calls already keys off
+        # the faithfully-decoding id+JSON, robust to the server/local special-token id mismatch): the model
+        # still emits its action, the parser extracts it. Every other model keeps its turn stops.
+        if not (self.is_inkling or self.is_glm):
+            for t in self._turn_stops:
+                if t not in stop:
+                    stop.append(t)
         # Cap generation so prompt + max_tokens stays inside the context window
         # (_render already trims the prompt to leave room).
         ctx = int(
@@ -466,7 +485,7 @@ class TinkerAPI(ModelAPI):
             max_tokens=max_tokens,
             temperature=0.0 if config.temperature is None else config.temperature,
             top_p=1.0 if config.top_p is None else config.top_p,
-            stop=stop,
+            stop=stop or None,
         )
 
         sampler = await self._sampler_client()
@@ -486,11 +505,26 @@ class TinkerAPI(ModelAPI):
         else:
             stop_reason = "stop"
 
+        # On-policy capture (gated on INSPECT_TINKER_CAPTURE_IDS=1, set by the agentic OPD/RL rollout):
+        # record the EXACT native prompt token-ids fed to the sampler + the sampled completion ids, plus
+        # the rendered message-dicts + tool schemas so the teacher context re-renders identically (only
+        # the system message swapped). Lets training score the sequence the model actually sampled under
+        # rather than a divergent SFT re-render. Off by default so ordinary evals aren't bloated.
+        md = None
+        if os.environ.get("INSPECT_TINKER_CAPTURE_IDS") == "1":
+            md = {
+                "tinker_prompt_ids": list(ids),
+                "tinker_completion_ids": list(seq.tokens),
+                "tinker_msgs": rendered_msgs,
+                "tinker_schemas": rendered_schemas,
+                "tinker_enable_thinking": bool(self.enable_thinking),
+            }
         message = ChatMessageAssistant(
             content=content,
             tool_calls=tool_calls or None,
             model=self.model_name,
             source="generate",
+            metadata=md,
         )
         usage = ModelUsage(
             input_tokens=len(ids),
