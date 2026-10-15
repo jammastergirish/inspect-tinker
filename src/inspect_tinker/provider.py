@@ -455,6 +455,10 @@ class TinkerAPI(ModelAPI):
         self.enable_thinking = bool(enable_thinking) or (
             os.environ.get("INSPECT_TINKER_ENABLE_THINKING") == "1"
         )
+        # Inkling gates reasoning on a `reasoning_effort` chat-template var
+        # (none/minimal/low/medium/high/max, or a float in [0,0.99]; default high). ct cannot pass
+        # model-args, so honour an env fallback INSPECT_TINKER_REASONING_EFFORT (unset = template default).
+        self.reasoning_effort = os.environ.get("INSPECT_TINKER_REASONING_EFFORT") or None
 
         # Detect the base model's family from its id; it selects the chat format, the
         # turn terminators, and how tool calls are rendered/parsed.
@@ -508,6 +512,8 @@ class TinkerAPI(ModelAPI):
         }
         if self.is_kimi:
             kwargs["thinking"] = self.enable_thinking
+        if self.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.reasoning_effort
         try:
             text = self.tokenizer.apply_chat_template(msgs, tools=schemas, **kwargs)
         except TypeError:
@@ -619,6 +625,7 @@ class TinkerAPI(ModelAPI):
                 "tinker_msgs": rendered_msgs,
                 "tinker_schemas": rendered_schemas,
                 "tinker_enable_thinking": bool(self.enable_thinking),
+                "tinker_reasoning_effort": self.reasoning_effort,
             }
         message = ChatMessageAssistant(
             content=content,
